@@ -1,0 +1,304 @@
+/*
+ *  Accident Detection System
+ *  Hardware : ESP8266 NodeMCU v3 + MPU-6050 + SW-420 + NEO-6M GPS + SIM800L
+ *  Author   : [Your Name]  |  GitHub: github.com/[username]/accident-detection-system
+ *  IDE      : Arduino IDE 2.x  |  Board: NodeMCU 1.0 (ESP-12E Module)
+ *
+ *  Libraries required (install via Arduino Library Manager):
+ *    - MPU6050 by Electronic Cats  (or Jeff Rowberg's I2Cdevlib)
+ *    - TinyGPS++ by Mikal Hart
+ *    - ESP8266WiFi  (bundled with ESP8266 Arduino Core)
+ *    - BlynkSimpleEsp8266  (optional – for IoT dashboard)
+ */
+ 
+// ─── Includes ────────────────────────────────────────────────────────────
+#include <Wire.h>
+#include <MPU6050.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+#include <ESP8266WiFi.h>
+ 
+// ─── Wi-Fi credentials ───────────────────────────────────────────────────
+const char* WIFI_SSID     = "YOUR_SSID";
+const char* WIFI_PASSWORD = "YOUR_PASSWORD";
+ 
+// ─── Emergency contact number (E.164 format) ────────────────────────────
+const char* EMERGENCY_NUM = "+91XXXXXXXXXX";
+ 
+// ─── Pin assignments ─────────────────────────────────────────────────────
+// GPS  → SoftwareSerial on D6 (RX), D7 (TX)
+// GSM  → SoftwareSerial on D3 (RX), D4 (TX)
+// MPU-6050 → I2C  SDA=D2, SCL=D1  (hardwired in NodeMCU)
+const int VIBRATION_PIN = D5;   // SW-420 digital output
+const int BUZZER_PIN    = D8;   // Active buzzer
+const int LED_PIN       = D0;   // Status LED
+ 
+// ─── Thresholds ──────────────────────────────────────────────────────────
+const float  ACCEL_THRESHOLD   = 2.0;   // g-force above 2g = accident
+const int    VIBRATION_COUNT   = 3;     // consecutive vibration hits
+const unsigned long DEBOUNCE_MS = 5000; // 5 s cooldown after alert
+ 
+// ─── Objects ─────────────────────────────────────────────────────────────
+MPU6050          mpu;
+TinyGPSPlus      gps;
+SoftwareSerial   gpsSerial(D6, D7);  // GPS RX, TX
+SoftwareSerial   gsmSerial(D3, D4);  // GSM RX, TX
+ 
+// ─── State variables ─────────────────────────────────────────────────────
+unsigned long lastAlertTime   = 0;
+int           vibrationCount  = 0;
+bool          accidentPending = false;
+ 
+// =========================================================================
+//  SETUP
+// =========================================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n[BOOT] Accident Detection System starting...");
+ 
+  // GPIO
+  pinMode(VIBRATION_PIN, INPUT);
+  pinMode(BUZZER_PIN,    OUTPUT);
+  pinMode(LED_PIN,       OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN,    LOW);
+ 
+  // I2C + MPU-6050
+  Wire.begin();
+  mpu.initialize();
+  if (mpu.testConnection()) {
+    Serial.println("[OK] MPU-6050 connected");
+  } else {
+    Serial.println("[ERR] MPU-6050 NOT found – check wiring!");
+  }
+  // Configure MPU-6050 full-scale range: ±8g for vehicle impacts
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_8);
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_500);
+  mpu.setDLPFMode(MPU6050_DLPF_BW_20);  // 20 Hz low-pass filter
+ 
+  // Software serials
+  gpsSerial.begin(9600);
+  gsmSerial.begin(9600);
+  Serial.println("[OK] GPS + GSM serials started");
+ 
+  // Wi-Fi
+  Serial.print("[WiFi] Connecting to ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int wifiTry = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiTry < 20) {
+    delay(500);
+    Serial.print(".");
+    wifiTry++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Connected: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n[WiFi] Not connected – GSM alert will still work");
+  }
+ 
+  // GSM initialisation
+  initGSM();
+ 
+  // Startup beep
+  beep(1, 100);
+  Serial.println("[READY] System monitoring...");
+}
+ 
+// =========================================================================
+//  MAIN LOOP
+// =========================================================================
+void loop() {
+  // Feed GPS decoder
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+ 
+  // Read sensors
+  float accel  = readAccelMagnitude();
+  bool  vibOn  = (digitalRead(VIBRATION_PIN) == HIGH);
+ 
+  // Vibration debounce counter
+  if (vibOn) vibrationCount++;
+  else       vibrationCount = max(0, vibrationCount - 1);
+ 
+  // Debug output every second (remove for production)
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 1000) {
+    Serial.printf("[SENSOR] Accel=%.2fg  Vib=%s  GPS=%s\n",
+      accel,
+      vibOn ? "YES" : "no",
+      gps.location.isValid() ? "OK" : "searching");
+    lastPrint = millis();
+  }
+ 
+  // Accident detection: high g-force AND persistent vibration
+  if (accel > ACCEL_THRESHOLD && vibrationCount >= VIBRATION_COUNT) {
+    unsigned long now = millis();
+    if (now - lastAlertTime > DEBOUNCE_MS) {  // cooldown guard
+      Serial.println("[!!!] ACCIDENT DETECTED");
+      lastAlertTime = now;
+      vibrationCount = 0;
+      triggerAccidentAlert(accel);
+    }
+  }
+ 
+  delay(50);  // ~20 Hz sampling
+}
+ 
+// =========================================================================
+//  SENSOR FUNCTIONS
+// =========================================================================
+ 
+/**
+ * Read raw accelerometer data from MPU-6050 and return
+ * the total g-force magnitude: sqrt(ax^2 + ay^2 + az^2).
+ * At rest this returns ~1.0 g (gravity).  Impact > 2.0 g.
+ */
+float readAccelMagnitude() {
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+ 
+  // ±8g range → LSB sensitivity = 4096 counts/g
+  const float LSB_PER_G = 4096.0;
+  float gx = ax / LSB_PER_G;
+  float gy = ay / LSB_PER_G;
+  float gz = az / LSB_PER_G;
+ 
+  return sqrt(gx*gx + gy*gy + gz*gz);
+}
+ 
+/**
+ * Read gyroscope (degrees/sec) – useful for roll-over detection.
+ * Returns magnitude of angular velocity vector.
+ */
+float readGyroMagnitude() {
+  int16_t gx, gy, gz;
+  mpu.getRotation(&gx, &gy, &gz);
+ 
+  // ±500 dps range → 65.5 LSB/(deg/s)
+  const float LSB_PER_DPS = 65.5;
+  float rx = gx / LSB_PER_DPS;
+  float ry = gy / LSB_PER_DPS;
+  float rz = gz / LSB_PER_DPS;
+ 
+  return sqrt(rx*rx + ry*ry + rz*rz);
+}
+ 
+// =========================================================================
+//  ACCIDENT RESPONSE
+// =========================================================================
+void triggerAccidentAlert(float accelValue) {
+  // 1. Local alert
+  beep(3, 300);
+  digitalWrite(LED_PIN, HIGH);
+ 
+  // 2. Get GPS coordinates (wait up to 3 s for fix)
+  String lat = "N/A", lng = "N/A", speed = "N/A";
+  unsigned long gpsWait = millis();
+  while (millis() - gpsWait < 3000) {
+    while (gpsSerial.available()) gps.encode(gpsSerial.read());
+    if (gps.location.isValid()) {
+      lat   = String(gps.location.lat(), 6);
+      lng   = String(gps.location.lng(), 6);
+      speed = String(gps.speed.kmph(), 1) + " km/h";
+      break;
+    }
+    delay(100);
+  }
+ 
+  Serial.println("[GPS] Lat=" + lat + "  Lng=" + lng);
+ 
+  // 3. Send SMS
+  String mapsLink = "https://maps.google.com/?q=" + lat + "," + lng;
+  String smsBody  =
+    "ACCIDENT ALERT!\n"
+    "G-Force: " + String(accelValue, 1) + "g\n"
+    "Location: " + lat + "," + lng + "\n"
+    "Map: " + mapsLink + "\n"
+    "Speed: " + speed;
+ 
+  sendSMS(EMERGENCY_NUM, smsBody);
+ 
+  // 4. (Optional) push to IoT dashboard
+  if (WiFi.status() == WL_CONNECTED) {
+    pushToCloud(lat, lng, accelValue);
+  }
+ 
+  // Keep LED on for 30 s
+  delay(30000);
+  digitalWrite(LED_PIN, LOW);
+}
+ 
+// =========================================================================
+//  GSM / SIM800L FUNCTIONS
+// =========================================================================
+void initGSM() {
+  Serial.println("[GSM] Initialising SIM800L...");
+  sendATCommand("AT",         "OK", 2000);
+  sendATCommand("AT+CMGF=1",  "OK", 1000);  // SMS text mode
+  sendATCommand("AT+CSCS=\"GSM\"", "OK", 1000);
+  Serial.println("[GSM] Ready");
+}
+ 
+void sendSMS(const char* number, String message) {
+  Serial.println("[GSM] Sending SMS to " + String(number));
+  gsmSerial.println("AT+CMGF=1");
+  delay(500);
+  gsmSerial.println(String("AT+CMGS=\"") + number + "\"");
+  delay(500);
+  gsmSerial.print(message);
+  delay(200);
+  gsmSerial.write(26);  // Ctrl+Z  → send
+  delay(3000);
+  Serial.println("[GSM] SMS sent");
+}
+ 
+String sendATCommand(String cmd, String expected, int timeout) {
+  gsmSerial.println(cmd);
+  String resp = "";
+  unsigned long t = millis();
+  while (millis() - t < (unsigned long)timeout) {
+    while (gsmSerial.available()) resp += (char)gsmSerial.read();
+    if (resp.indexOf(expected) != -1) break;
+  }
+  Serial.println("[AT] " + cmd + " → " + resp);
+  return resp;
+}
+ 
+// =========================================================================
+//  IoT CLOUD (simple HTTP GET to ThingSpeak / custom server)
+// =========================================================================
+void pushToCloud(String lat, String lng, float accel) {
+  WiFiClient client;
+  const char* host = "api.thingspeak.com";
+  String apiKey    = "YOUR_THINGSPEAK_API_KEY";
+ 
+  if (client.connect(host, 80)) {
+    String url = "/update?api_key=" + apiKey
+               + "&field1=" + lat
+               + "&field2=" + lng
+               + "&field3=" + String(accel, 2);
+    client.println("GET " + url + " HTTP/1.1");
+    client.println("Host: " + String(host));
+    client.println("Connection: close");
+    client.println();
+    delay(500);
+    client.stop();
+    Serial.println("[Cloud] Data pushed to ThingSpeak");
+  } else {
+    Serial.println("[Cloud] Connection failed");
+  }
+}
+ 
+// =========================================================================
+//  UTILITY
+// =========================================================================
+void beep(int times, int ms) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(ms);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(ms);
+  }
+}
